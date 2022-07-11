@@ -1,92 +1,59 @@
-import requests, time, json, configparser, smtplib, logging, datetime
+#!/usr/bin/python3
+from datetime import datetime
+from configparser import ConfigParser
 
-# Reading the keys from the cfauth.ini file
-config = configparser.ConfigParser()
-config.read('cfauth.ini')
+import logging
+import json
+import requests
+import sys
 
-zone_id = config.get('tokens', 'zone_id')
-bearer_token = config.get('tokens', 'bearer_token')
-record_id = config.get('tokens', 'record_id')
 
-# Setting up the logger (a file where it records all IP changes)
-logging.basicConfig(level=logging.INFO, filename='ipchanges.log', format='%(levelname)s :: %(message)s')
+def main():
+    # Setup the logger
+    logging.basicConfig(
+            format='[%(levelname)s] %(asctime)s ~ %(message)s',
+            datefmt='%Y-%m-%d %H:%M',
+            level=logging.INFO,
+            stream=sys.stdout
+    )
 
-# The headers we want to use
-headers = {
-    "Authorization": f"Bearer {bearer_token}", 
-    "content-type": "application/json"
+    config = ConfigParser()
+    config.read('config.ini')
+
+    config_auth_section = 'AUTH'
+    zone_id   = config.get(config_auth_section, 'zone_id')
+    api_token = config.get(config_auth_section, 'api_token')
+    record_id = config.get(config_auth_section, 'record_id')
+
+    config_conf_section = 'CONFIG'
+    ip_request_url = config.get(config_conf_section, 'ip_request_url')
+
+    cloudflare_api = f'https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{record_id}'
+    headers = {
+        'Authorization': f'Bearer {api_token}',
+        'Content-Type': 'application/json'
     }
 
-while True:
-    # Getting the initial data of your A Record
-    a_record_url = requests.get(f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{record_id}", headers=headers)
-    arecordjson = a_record_url.json()
+    a_record = requests.get(cloudflare_api, headers=headers)
+    if (a_record.status_code != 200):
+        return logging.error('Failed to fetch the A record data.')
 
-    # This is the current IP that your chosen A record has been set to on Cloudflare
-    current_set_ip = arecordjson['result']['content']
+    current_ip = requests.get(ip_request_url)
+    if (current_ip.status_code != 200):
+        return logging.error('Failed to fetch the current IP (API may be down).')
 
-    # This gets your current live external IP (whether that is the same as the A record or not)
-    currentip = requests.get("https://api.ipify.org?format=json")
+    a_record_ip = a_record.json()['result']['content']
+    current_ip = current_ip.json()['ip']
+    if (a_record_ip == current_ip):
+        return logging.info('Record IP did not need updating.')
 
-    # Status code should be 200, otherwise the API is probably down (this can happen quite a bit)
-    ipcheck_status = currentip.status_code
+    # Send a PATCH request so that only the payload-specified content is
+    # replaced and the entire A record is not overwritten.
+    #
+    # https://developers.cloudflare.com/dns/manage-dns-records/how-to/create-dns-records#edit-dns-records
+    payload = {'content': current_ip}
+    requests.patch(cloudflare_api, headers=headers, data=json.dumps(payload))
+    logging.info(f'A record IP updated: {a_record_ip} -> {current_ip}.')
 
-    # Handling any API errors (otherwise we'd be trying to change the IP to some random HTML)
-    while ipcheck_status != 200:
-        time.sleep(10)
-        currentip = requests.get("https://api.ipify.org?format=json")
-        ipcheck_status = currentip.status_code
-
-    currentactualip = currentip.json()['ip']
-
-    # This loop checks your live IP every 5 minutes to make sure that it's the same one as set in your DNS record
-    while currentactualip == current_set_ip:
-        time.sleep(300) # Wait for 300 seconds (5 minutes)
-        currentip = requests.get("https://api.ipify.org?format=json") # Then it checks if your IP is still the same or not.
-        ipcheck_status = currentip.status_code
-
-    # Handling any API errors AGAIN
-        while ipcheck_status != 200:
-            time.sleep(10)
-            currentip = requests.get("https://api.ipify.org?format=json")
-            ipcheck_status = currentip.status_code
-
-        currentactualip = currentip.json()['ip']
-
-    else: # If your live IP is NOT the same as the A Record's IP
-        pass
-
-    # The "Payload" is what we want to change in the DNS record JSON (in this case, it's our IP)
-    payload = {"content": currentactualip}
-
-    # Change the IP using a PATCH request
-    requests.patch(f"https://api.cloudflare.com/client/v4/zones/{zone_id}/dns_records/{record_id}", headers=headers, data=json.dumps(payload))
-    
-    # Get the time of the IP change
-    now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-    # LOG THE CHANGE
-    logging.info(f"{now} - IP change from {current_set_ip} to {currentactualip}")
-
-
-    # Sends an email to you to let you know everything has been updated.
-    # If you don't want this, just delete everything below this comment.
-
-    sender = 'sender@google.com'
-    receivers = ['receiver@example.com']
-
-    message = f"""From: Server <sender@google.com>
-    To: Your email <receiver@example.com>
-    Subject: DNS IP Updated
-
-    The server's IP has changed from {current_set_ip} to {currentactualip}.
-
-    The DNS records have been updated.
-    """
-
-    smtpObj = smtplib.SMTP('smtp.example.com', port=587)
-    smtpObj.connect("smtp.example.com", port=587)
-    smtpObj.ehlo()
-    smtpObj.starttls()
-    smtpObj.login("username", "password")
-    smtpObj.sendmail(sender, receivers, message)
+if __name__ == '__main__':
+    main()
